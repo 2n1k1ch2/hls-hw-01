@@ -1,0 +1,117 @@
+services:
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+    ports:
+      - "5436:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+
+  app:
+    build: .
+    ports:
+      - "8080:8080"
+    environment:
+      POD: "shop-1"
+      DATACENTER: "dc-1"
+      DEPLOYMENT: "shop-api"
+      DATABASE_URL: "host=postgres port=5432 user=${POSTGRES_USER} password=${POSTGRES_PASSWORD} dbname=${POSTGRES_DB} sslmode=disable connect_timeout=5"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: [ "CMD", "curl", "-fsS", "http://localhost:8080/health" ]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+
+  victoria-metrics:
+    image: victoriametrics/victoria-metrics:v1.118.0
+    command:
+      - "-promscrape.config=/etc/prometheus/prometheus.yml"
+      - "-storageDataPath=/victoria-metrics-data"
+    ports:
+      - "8428:8428"
+    volumes:
+      - ./victoria-metrics.yml:/etc/prometheus/prometheus.yml:ro
+      - victoria_data:/victoria-metrics-data
+
+  grafana:
+    image: grafana/grafana:12.0.0
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?Set GRAFANA_ADMIN_PASSWORD in .env}
+    healthcheck:
+      test: [ "CMD", "wget", "-q", "-O", "/dev/null", "http://localhost:3000/api/health" ]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 15s
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./grafana/provisioning/datasources:/etc/grafana/provisioning/datasources:ro
+
+  grafana-token-init:
+    image: alpine:3.22
+    command: [ "sh", "/scripts/init-token.sh" ]
+    environment:
+      GRAFANA_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GRAFANA_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?Set GRAFANA_ADMIN_PASSWORD in .env}
+    volumes:
+      - ./grafana/init-token.sh:/scripts/init-token.sh:ro
+      - grafana_token:/token
+    depends_on:
+      grafana:
+        condition: service_healthy
+    restart: "no"
+
+  dashboard-generator:
+    build:
+      context: .
+      dockerfile: DashboardGenerator.Dockerfile
+    environment:
+      APP_URL: http://app:8080
+      GRAFANA_URL: http://grafana:3000
+      GRAFANA_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GRAFANA_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?Set GRAFANA_ADMIN_PASSWORD in .env}
+    volumes:
+      - grafana_token:/run/grafana-token:ro
+    depends_on:
+      app:
+        condition: service_healthy
+      grafana:
+        condition: service_healthy
+      grafana-token-init:
+        condition: service_completed_successfully
+    restart: "no"
+
+  migrate:
+    image: migrate/migrate
+    volumes:
+      - ./migrations:/migrations:ro
+    command:
+      - "-path=/migrations"
+      - "-database=postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}?sslmode=disable"
+      - "up"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+volumes:
+  postgres_data:
+  victoria_data:
+  grafana_data:
+  grafana_token:
