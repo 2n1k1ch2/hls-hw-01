@@ -12,36 +12,18 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/grafana/grafana-foundation-sdk/go/common"
+	"github.com/grafana/grafana-foundation-sdk/go/dashboard"
+	"github.com/grafana/grafana-foundation-sdk/go/prometheus"
+	"github.com/grafana/grafana-foundation-sdk/go/timeseries"
 )
-
-type RoutesResponse struct {
-	Routes []string `json:"routes"`
-}
-
-type ServiceAccount struct {
-	ID   int    `json:"id"`
-	Name string `json:"name"`
-}
-
-type ServiceAccountsResponse struct {
-	ServiceAccounts []ServiceAccount `json:"serviceAccounts"`
-}
-
-type TokenResponse struct {
-	Key string `json:"key"`
-}
 
 var client = &http.Client{Timeout: 10 * time.Second}
 
 func main() {
 	grafanaURL := env("GRAFANA_URL", "http://grafana:3000")
 	appURL := env("APP_URL", "http://app:8080")
-	adminUser := env("GRAFANA_ADMIN_USER", "admin")
-	adminPassword := os.Getenv("GRAFANA_ADMIN_PASSWORD")
-
-	if adminPassword == "" {
-		log.Fatal("GRAFANA_ADMIN_PASSWORD is required")
-	}
 
 	if err := waitForGrafana(grafanaURL); err != nil {
 		log.Fatal(err)
@@ -52,19 +34,22 @@ func main() {
 		log.Fatal(err)
 	}
 
-	token, err := createServiceAccountToken(
-		grafanaURL,
-		adminUser,
-		adminPassword,
-	)
+	data, err := os.ReadFile("/run/grafana-token/token")
+	if err != nil {
+		log.Fatal(err)
+	}
+	token := strings.TrimSpace(string(data))
+	if token == "" {
+		log.Fatal("Grafana service account token is empty")
+	}
+
+	d, err := makeDashboard(routes)
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	dashboard := makeDashboard(routes)
-
 	body := map[string]any{
-		"dashboard": dashboard,
+		"dashboard": d,
 		"folderId":  0,
 		"overwrite": true,
 		"message":   "Generated automatically from application routes",
@@ -76,7 +61,6 @@ func main() {
 		"/api/dashboards/db",
 		body,
 		token,
-		"", "",
 	)
 	if err != nil {
 		log.Fatal(err)
@@ -96,12 +80,10 @@ func env(key, fallback string) string {
 }
 
 func waitForGrafana(baseURL string) error {
-	for i := 0; i < 60; i++ {
+	for range 60 {
 		resp, err := client.Get(baseURL + "/api/health")
 		if err == nil {
-			_, _ = io.Copy(io.Discard, resp.Body)
-			_ = resp.Body.Close()
-
+			resp.Body.Close()
 			if resp.StatusCode == http.StatusOK {
 				return nil
 			}
@@ -115,15 +97,18 @@ func waitForGrafana(baseURL string) error {
 func getRoutes(baseURL string) ([]string, error) {
 	var lastErr error
 
-	for i := 0; i < 60; i++ {
+	for range 60 {
 		resp, err := client.Get(baseURL + "/routes")
 		if err == nil {
-			data, readErr := io.ReadAll(resp.Body)
-			_ = resp.Body.Close()
+			var result struct {
+				Routes []string `json:"routes"`
+			}
 
-			if readErr == nil && resp.StatusCode == http.StatusOK {
-				var result RoutesResponse
-				if err := json.Unmarshal(data, &result); err == nil {
+			if resp.StatusCode == http.StatusOK {
+				err = json.NewDecoder(resp.Body).Decode(&result)
+				resp.Body.Close()
+
+				if err == nil {
 					routes := make([]string, 0, len(result.Routes))
 
 					for _, route := range result.Routes {
@@ -140,10 +125,10 @@ func getRoutes(baseURL string) ([]string, error) {
 						return nil, fmt.Errorf("no application routes found")
 					}
 					return routes, nil
-				} else {
-					lastErr = err
 				}
+				lastErr = err
 			} else {
+				resp.Body.Close()
 				lastErr = fmt.Errorf("GET /routes returned HTTP %d", resp.StatusCode)
 			}
 		} else {
@@ -159,7 +144,7 @@ func getRoutes(baseURL string) ([]string, error) {
 func grafanaRequest(
 	baseURL, method, path string,
 	body any,
-	token, username, password string,
+	token string,
 ) (int, []byte, error) {
 	var requestBody io.Reader
 
@@ -177,12 +162,7 @@ func grafanaRequest(
 	}
 
 	req.Header.Set("Content-Type", "application/json")
-
-	if token != "" {
-		req.Header.Set("Authorization", "Bearer "+token)
-	} else if username != "" {
-		req.SetBasicAuth(username, password)
-	}
+	req.Header.Set("Authorization", "Bearer "+token)
 
 	resp, err := client.Do(req)
 	if err != nil {
@@ -195,156 +175,81 @@ func grafanaRequest(
 		return resp.StatusCode, nil, err
 	}
 
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return resp.StatusCode, data, nil
-	}
-
 	return resp.StatusCode, data, nil
 }
 
-func createServiceAccountToken(
-	baseURL, username, password string,
-) (string, error) {
-	const accountName = "shop-dashboard-generator"
+func makeDashboard(routes []string) (dashboard.Dashboard, error) {
 
-	status, data, err := grafanaRequest(
-		baseURL,
-		http.MethodPost,
-		"/api/serviceaccounts",
-		map[string]any{
-			"name":       accountName,
-			"role":       "Editor",
-			"isDisabled": false,
-		},
-		"", username, password,
-	)
-	if err != nil {
-		return "", err
+	dsType := "prometheus"
+	dsUID := "victoriametrics"
+
+	ds := common.DataSourceRef{
+		Type: &dsType,
+		Uid:  &dsUID,
 	}
 
-	var account ServiceAccount
+	d := dashboard.NewDashboardBuilder(
+		"Shop API — automatically generated",
+	).
+		Uid("shop-api-auto").
+		Tags([]string{"shop-api", "generated"}).
+		Refresh("5s").
+		Time("now-15m", "now").
+		Readonly()
 
-	if status >= 200 && status < 300 {
-		if err := json.Unmarshal(data, &account); err != nil {
-			return "", err
-		}
-	} else if status == http.StatusConflict {
-		// Reuse the service account if the generator has run before.
-		status, data, err = grafanaRequest(
-			baseURL,
-			http.MethodGet,
-			"/api/serviceaccounts/search?query="+accountName,
-			nil,
-			"", username, password,
+	variables := []struct {
+		name  string
+		label string
+		query string
+	}{
+		{
+			name:  "datacenter",
+			label: "Datacenter",
+			query: "label_values(http_requests_total, datacenter)",
+		},
+		{
+			name:  "pod",
+			label: "Pod",
+			query: `label_values(http_requests_total{datacenter=~"${datacenter:regex}"}, pod)`,
+		},
+	}
+
+	for _, v := range variables {
+		d = d.WithVariable(
+			dashboard.NewQueryVariableBuilder(v.name).
+				Label(v.label).
+				Datasource(ds).
+				Definition(v.query).
+				Query(dashboard.StringOrMap{
+					Map: map[string]any{
+						"query": v.query,
+						"refId": "PrometheusVariableQueryEditor-VariableQuery",
+					},
+				}).
+				Refresh(dashboard.VariableRefreshOnDashboardLoad).
+				Multi(true).
+				IncludeAll(true).
+				AllValue(".*"),
 		)
-		if err != nil {
-			return "", err
-		}
-		if status < 200 || status >= 300 {
-			return "", fmt.Errorf("search service account: HTTP %d: %s", status, data)
-		}
-
-		var result ServiceAccountsResponse
-		if err := json.Unmarshal(data, &result); err != nil {
-			return "", err
-		}
-
-		for _, candidate := range result.ServiceAccounts {
-			if candidate.Name == accountName {
-				account = candidate
-				break
-			}
-		}
-	} else {
-		return "", fmt.Errorf("create service account: HTTP %d: %s", status, data)
 	}
 
-	if account.ID == 0 {
-		return "", fmt.Errorf("service account %q not found", accountName)
+	type metric struct {
+		title string
+		expr  string
+		unit  string
 	}
 
-	status, data, err = grafanaRequest(
-		baseURL,
-		http.MethodPost,
-		fmt.Sprintf("/api/serviceaccounts/%d/tokens", account.ID),
-		map[string]any{
-			"name": "dashboard-generator",
-		},
-		"", username, password,
-	)
-	if err != nil {
-		return "", err
-	}
-	if status < 200 || status >= 300 {
-		return "", fmt.Errorf("create service account token: HTTP %d: %s", status, data)
-	}
+	panelID := uint32(1)
 
-	var result TokenResponse
-	if err := json.Unmarshal(data, &result); err != nil {
-		return "", err
-	}
-	if result.Key == "" {
-		return "", fmt.Errorf("Grafana returned an empty service account token")
-	}
+	for _, route := range routes {
+		d = d.WithRow(dashboard.NewRowBuilder(route))
 
-	return result.Key, nil
-}
-
-func makeDashboard(routes []string) map[string]any {
-	datasource := map[string]any{
-		"type": "prometheus",
-		"uid":  "victoriametrics",
-	}
-
-	variables := []any{
-		map[string]any{
-			"name":       "datacenter",
-			"label":      "Datacenter",
-			"type":       "query",
-			"datasource": datasource,
-			"definition": "label_values(http_requests_total, datacenter)",
-			"query":      map[string]any{"query": "label_values(http_requests_total, datacenter)", "refId": "PrometheusVariableQueryEditor-VariableQuery"},
-			"refresh":    1,
-			"multi":      true,
-			"includeAll": true,
-			"allValue":   ".*",
-			"current":    map[string]any{"selected": true, "text": "All", "value": "$__all"},
-			"options":    []any{},
-			"hide":       0,
-		},
-		map[string]any{
-			"name":       "pod",
-			"label":      "Pod",
-			"type":       "query",
-			"datasource": datasource,
-			"definition": "label_values(http_requests_total{datacenter=~\"${datacenter:regex}\"}, pod)",
-			"query":      map[string]any{"query": "label_values(http_requests_total{datacenter=~\"${datacenter:regex}\"}, pod)", "refId": "PrometheusVariableQueryEditor-VariableQuery"},
-			"refresh":    1,
-			"multi":      true,
-			"includeAll": true,
-			"allValue":   ".*",
-			"current":    map[string]any{"selected": true, "text": "All", "value": "$__all"},
-			"options":    []any{},
-			"hide":       0,
-		},
-	}
-
-	panels := make([]any, 0, len(routes)*3)
-	panelID := 1
-
-	for row, route := range routes {
-		handler := strconv.Quote(route)
 		selector := fmt.Sprintf(
 			`datacenter=~"${datacenter:regex}", pod=~"${pod:regex}", handler=%s`,
-			handler,
+			strconv.Quote(route),
 		)
-		errorSelector := selector + `, status=~"[45].."`
 
-		queries := []struct {
-			title string
-			expr  string
-			unit  string
-		}{
+		queries := []metric{
 			{
 				title: "Requests / second",
 				expr:  "sum(rate(http_requests_total{" + selector + "}[1m])) or vector(0)",
@@ -352,74 +257,36 @@ func makeDashboard(routes []string) map[string]any {
 			},
 			{
 				title: "Errors / second",
-				expr:  "sum(rate(http_requests_total{" + errorSelector + "}[1m])) or vector(0)",
-				unit:  "reqps",
+				expr: "sum(rate(http_requests_total{" + selector +
+					`, status=~"[45].."}[1m])) or vector(0)`,
+				unit: "reqps",
 			},
 			{
 				title: "Latency p95",
 				expr: "histogram_quantile(0.95, sum by (le) (" +
-					"rate(http_request_duration_seconds_bucket{" + selector + "}[5m])))",
+					"rate(http_request_duration_seconds_bucket{" +
+					selector + "}[5m])))",
 				unit: "s",
 			},
 		}
 
-		for col, query := range queries {
-			panels = append(panels, map[string]any{
-				"id":         panelID,
-				"title":      route + " — " + query.title,
-				"type":       "timeseries",
-				"datasource": datasource,
-				"gridPos": map[string]any{
-					"x": col * 8,
-					"y": row * 8,
-					"w": 8,
-					"h": 8,
-				},
-				"targets": []any{
-					map[string]any{
-						"refId":        "A",
-						"expr":         query.expr,
-						"legendFormat": route,
-					},
-				},
-				"fieldConfig": map[string]any{
-					"defaults":  map[string]any{"unit": query.unit},
-					"overrides": []any{},
-				},
-				"options": map[string]any{
-					"legend": map[string]any{
-						"showLegend": false,
-					},
-					"tooltip": map[string]any{
-						"mode": "single",
-					},
-				},
-			})
+		for _, q := range queries {
+			d = d.WithPanel(
+				timeseries.NewPanelBuilder().
+					Id(panelID).
+					Title(route + " — " + q.title).
+					Datasource(ds).
+					Unit(q.unit).
+					Height(8).
+					WithTarget(
+						prometheus.NewDataqueryBuilder().
+							Expr(q.expr).
+							LegendFormat(route),
+					),
+			)
 			panelID++
 		}
 	}
 
-	return map[string]any{
-		"id":            nil,
-		"uid":           "shop-api-auto",
-		"title":         "Shop API — automatically generated",
-		"tags":          []string{"shop-api", "generated"},
-		"schemaVersion": 39,
-		"version":       0,
-		"editable":      false,
-		"refresh":       "5s",
-		"time": map[string]any{
-			"from": "now-15m",
-			"to":   "now",
-		},
-		"templating": map[string]any{
-			"list": variables,
-		},
-		"annotations": map[string]any{
-			"list": []any{},
-		},
-		"panels": panels,
-	}
+	return d.Build()
 }
-
-var _ = strings.TrimSpace
