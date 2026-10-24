@@ -20,9 +20,9 @@ services:
     ports:
       - "8080:8080"
     environment:
-      POD: "shop-1"
-      DATACENTER: "dc-1"
-      DEPLOYMENT: "shop-api"
+      POD: ${POD_ID:-shop-1}
+      DATACENTER: ${DATACENTER_ID:-dc-1}
+      DEPLOYMENT: ${DEPLOYMENT_ID:-shop-api}
       DATABASE_URL: "host=postgres port=5432 user=${POSTGRES_USER} password=${POSTGRES_PASSWORD} dbname=${POSTGRES_DB} sslmode=disable connect_timeout=5"
     depends_on:
       postgres:
