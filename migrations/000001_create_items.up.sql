@@ -1,0 +1,6 @@
+CREATE TABLE IF NOT EXISTS items (
+    id UUID PRIMARY KEY,
+    name TEXT NOT NULL,
+    count INTEGER NOT NULL,
+    price INTEGER NOT NULL
+);
